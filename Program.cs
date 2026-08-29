@@ -8,6 +8,7 @@ using System;
 using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Windows.Forms;
@@ -502,6 +503,9 @@ internal sealed class BlackoutManager
                 foreach (var ind in _indicators) ind.Show();
             }
 
+            // 5.6 隐藏桌面悬浮球（DesktopDock 置顶窗口会浮在遮罩上）
+            DockHider.Hide();
+
             // 6. 高频维护：无损重申置顶 + 无条件重设捕获排除标志
             _topmostTimer = new System.Windows.Forms.Timer { Interval = 250 };
             _topmostTimer.Tick += (s, e) =>
@@ -518,6 +522,8 @@ internal sealed class BlackoutManager
                 {
                     if (!ind.IsDisposed) ind.AssertTopmost();
                 }
+                // 悬浮球若被看门狗拉起则再次隐藏
+                DockHider.EnsureHidden();
             };
             _topmostTimer.Start();
 
@@ -577,6 +583,9 @@ internal sealed class BlackoutManager
         // 光标还原：两条路径都无条件执行，确保任何一种隐藏方式都被撤销
         if (_cursorHidden) { try { Native.ShowCursorGlobal(); } catch { } _cursorHidden = false; }
         SystemCursorHider.Restore();
+
+        // 悬浮球还原显示
+        DockHider.Restore();
 
         // 老板模式黑屏过：光标位置还原
         if (wasActive && !_remoteMode)
@@ -673,6 +682,65 @@ internal sealed class IndicatorForm : Form
                 Native.SWP_NOMOVE | Native.SWP_NOSIZE | Native.SWP_NOACTIVATE | Native.SWP_SHOWWINDOW);
         }
         catch { }
+    }
+}
+
+// ============================ 悬浮球适配（DesktopDock） ============================
+// 桌面悬浮球（DesktopDock）是置顶 WPF 窗口，黑屏时会浮在纯黑遮罩上面，
+// 远程隐身模式下还会被手机端看到。黑屏期间用 ShowWindow(SW_HIDE) 隐藏它，
+// 恢复时还原。不补丁悬浮球本身——它怎么升级都不受影响。
+// 若黑屏期间悬浮球被看门狗拉起，250ms 定时器会再次隐藏。
+
+internal static class DockHider
+{
+    private const string DockProcessName = "DesktopDock";
+    private const int SW_HIDE = 0, SW_SHOW = 5;
+
+    private static readonly List<IntPtr> _hiddenHwnds = new();
+    private static bool _active;
+
+    public static void Hide()
+    {
+        _active = true;
+        HideOnce();
+    }
+
+    // 定时器调用：处理黑屏期间悬浮球被重启/新窗口出现的情况
+    public static void EnsureHidden()
+    {
+        if (_active) HideOnce();
+    }
+
+    private static void HideOnce()
+    {
+        try
+        {
+            var pids = Process.GetProcessesByName(DockProcessName)
+                              .Select(p => (uint)p.Id).ToHashSet();
+            if (pids.Count == 0) return;
+
+            Native.EnumWindows((h, l) =>
+            {
+                Native.GetWindowThreadProcessId(h, out uint pid);
+                if (pids.Contains(pid) && Native.IsWindowVisible(h))
+                {
+                    Native.ShowWindow(h, SW_HIDE);
+                    if (!_hiddenHwnds.Contains(h)) _hiddenHwnds.Add(h);
+                }
+                return true;
+            }, IntPtr.Zero);
+        }
+        catch { }
+    }
+
+    public static void Restore()
+    {
+        _active = false;
+        foreach (var h in _hiddenHwnds)
+        {
+            try { if (Native.IsWindow(h)) Native.ShowWindow(h, SW_SHOW); } catch { }
+        }
+        _hiddenHwnds.Clear();
     }
 }
 
@@ -926,6 +994,23 @@ internal static class Native
 
     [DllImport("user32.dll")]
     internal static extern bool SetLayeredWindowAttributes(IntPtr hWnd, uint crKey, byte bAlpha, uint dwFlags);
+
+    [DllImport("user32.dll")]
+    internal static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
+
+    internal delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+
+    [DllImport("user32.dll")]
+    internal static extern bool IsWindowVisible(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    internal static extern bool IsWindow(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    internal static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+
+    [DllImport("user32.dll")]
+    internal static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
 
     [DllImport("user32.dll")]
     internal static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter,
