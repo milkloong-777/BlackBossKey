@@ -1,0 +1,26 @@
+# Binaries
+dist/*.exe
+dist/*_old.exe
+dist/*_old.exe.bak
+
+# Build output
+bin/
+obj/
+
+# IDE
+.vs/
+.vscode/
+*.user
+*.suo
+
+# Test project build output
+BlackBossKeyTest/bin/
+BlackBossKeyTest/obj/
+
+# OS
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# Logs (runtime generated)
+*.log
