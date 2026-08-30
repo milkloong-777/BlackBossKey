@@ -149,10 +149,19 @@ internal static class StateFile
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
         "BlackBossKey");
     private static readonly string MuteFlagPath = Path.Combine(Dir, "mute_was_set.flag");
+    private static readonly string CursorFlagPath = Path.Combine(Dir, "cursor_was_hidden.flag");
 
     public static void SetMuteFlag() { try { File.WriteAllText(MuteFlagPath, "1"); } catch { } }
-    public static void Clear() { try { if (File.Exists(MuteFlagPath)) File.Delete(MuteFlagPath); } catch { } }
     public static bool Exists() { try { return File.Exists(MuteFlagPath); } catch { return false; } }
+
+    public static void SetCursorFlag() { try { File.WriteAllText(CursorFlagPath, "1"); } catch { } }
+    public static bool CursorFlagExists() { try { return File.Exists(CursorFlagPath); } catch { return false; } }
+
+    public static void Clear()
+    {
+        try { if (File.Exists(MuteFlagPath)) File.Delete(MuteFlagPath); } catch { }
+        try { if (File.Exists(CursorFlagPath)) File.Delete(CursorFlagPath); } catch { }
+    }
 }
 
 internal static class CrashRecovery
@@ -164,6 +173,14 @@ internal static class CrashRecovery
         {
             Logger.Write("检测到上次崩溃残留（静音标记存在），正在还原音频…");
             try { AudioController.SetMute(false); } catch { }
+            StateFile.Clear();
+        }
+
+        // 光标隐藏残留：强杀时系统光标可能还是空白替换状态
+        if (StateFile.CursorFlagExists())
+        {
+            Logger.Write("检测到光标隐藏标记，正在还原系统光标…");
+            SystemCursorHider.ForceRestore();
             StateFile.Clear();
         }
     }
@@ -341,6 +358,13 @@ internal static class SystemCursorHider
         try { Native.SystemParametersInfo(Native.SPI_SETCURSORS, 0, IntPtr.Zero, 0); } catch { }
         _hidden = false;
     }
+
+    // 无条件还原：供崩溃恢复使用（新进程里 _hidden 恒为 false，需要绕过守卫）
+    public static void ForceRestore()
+    {
+        try { Native.SystemParametersInfo(Native.SPI_SETCURSORS, 0, IntPtr.Zero, 0); } catch { }
+        _hidden = false;
+    }
 }
 
 // ============================ 键盘拦截（黑屏期间） ============================
@@ -472,8 +496,16 @@ internal sealed class BlackoutManager
                 }
                 catch { _audioWasMute = null; }
 
-                // 4. 隐藏鼠标（遮罩置顶后全屏范围内光标不可见）
-                try { Native.HideCursorGlobal(); _cursorHidden = true; } catch { _cursorHidden = false; }
+                // 4. 系统级隐藏光标（黑幕盖在鼠标之上）：遮罩点击穿透后光标悬停在
+                //    其他窗口上，ShowCursor（按线程）无效，必须替换系统光标才能隐身。
+                //    鼠标本身继续工作：移动、点击全部正常作用到下层窗口。
+                try
+                {
+                    SystemCursorHider.Hide();
+                    _cursorHidden = true;
+                    StateFile.SetCursorFlag();
+                }
+                catch { _cursorHidden = false; }
             }
             else
             {
@@ -484,10 +516,10 @@ internal sealed class BlackoutManager
                 // SystemCursorHider 类保留，仅在 --restore-cursors 紧急还原时使用。
             }
 
-            // 5. 为每块显示器创建纯黑遮罩
+            // 5. 为每块显示器创建纯黑遮罩（两种模式都点击穿透——鼠标保持可用）
             foreach (var screen in Screen.AllScreens)
             {
-                var form = new BlackoutForm(screen, remoteMode);
+                var form = new BlackoutForm(screen, clickThrough: true);
                 _overlays.Add(form);
             }
             foreach (var form in _overlays) form.Show();
@@ -580,9 +612,10 @@ internal sealed class BlackoutManager
             _audioWasMute = null;
         }
 
-        // 光标还原：两条路径都无条件执行，确保任何一种隐藏方式都被撤销
-        if (_cursorHidden) { try { Native.ShowCursorGlobal(); } catch { } _cursorHidden = false; }
+        // 光标还原：系统级替换还原（黑幕盖在鼠标上的隐藏方式）
+        _cursorHidden = false;
         SystemCursorHider.Restore();
+        StateFile.Clear();
 
         // 悬浮球还原显示
         DockHider.Restore();
@@ -623,7 +656,7 @@ internal sealed class BlackoutManager
 
         foreach (var screen in Screen.AllScreens)
         {
-            var form = new BlackoutForm(screen, _remoteMode);
+            var form = new BlackoutForm(screen, clickThrough: true);
             _overlays.Add(form);
             if (_remoteMode) _indicators.Add(new IndicatorForm(screen));
         }
