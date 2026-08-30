@@ -263,6 +263,10 @@ internal sealed class HotkeyContext : ApplicationContext
         _tray.ContextMenuStrip = menu;
         _tray.DoubleClick += (s, e) => _manager.Toggle();
 
+        // 启动即显示常驻状态灯（绿 = 黑幕关闭，红 = 黑幕开启）
+        _manager.EnsureLights();
+        _manager.SetLights(false);
+
         // 启动提示：让用户明确知道程序已在运行、热键是什么
         _tray.ShowBalloonTip(3000, "BlackBossKey 已启动",
             $"黑屏开关：{_toggleKeyName}\n远程隐身：Ctrl+Alt+F11\n强制恢复：Ctrl+Alt+Esc",
@@ -448,7 +452,7 @@ internal sealed class KeyboardBlocker
 internal sealed class BlackoutManager
 {
     private readonly List<BlackoutForm> _overlays = new();
-    private readonly List<IndicatorForm> _indicators = new();
+    private readonly List<IndicatorForm> _lights = new();   // 常驻状态灯：红=开启 绿=关闭
     private System.Windows.Forms.Timer? _topmostTimer;
     private bool _active;
     private bool _remoteMode;      // 远程隐身模式：物理屏黑、屏幕捕获看到真实桌面
@@ -524,16 +528,9 @@ internal sealed class BlackoutManager
             }
             foreach (var form in _overlays) form.Show();
 
-            // 5.5 远程模式：每块屏右上角显示小红点状态指示（不做捕获排除，
-            //     因此手机远程画面也可见 → 红点在=远程隐身开启，红点消失=关闭）
-            if (remoteMode)
-            {
-                foreach (var screen in Screen.AllScreens)
-                {
-                    _indicators.Add(new IndicatorForm(screen));
-                }
-                foreach (var ind in _indicators) ind.Show();
-            }
+            // 5.5 状态灯切红：黑幕开启（常驻灯，红=开 绿=关，远程画面可见）
+            EnsureLights();
+            SetLights(true);
 
             // 5.6 隐藏桌面悬浮球（DesktopDock 置顶窗口会浮在遮罩上）
             DockHider.Hide();
@@ -549,10 +546,10 @@ internal sealed class BlackoutManager
                     form.RealignIfNecessary();
                     if (remoteMode) form.ApplyCaptureExclusion();
                 }
-                // 指示灯要保持压在遮罩之上
-                foreach (var ind in _indicators)
+                // 状态灯要保持压在遮罩之上
+                foreach (var light in _lights)
                 {
-                    if (!ind.IsDisposed) ind.AssertTopmost();
+                    if (!light.IsDisposed) light.AssertTopmost();
                 }
                 // 悬浮球若被看门狗拉起则再次隐藏
                 DockHider.EnsureHidden();
@@ -597,12 +594,8 @@ internal sealed class BlackoutManager
         }
         _overlays.Clear();
 
-        foreach (var ind in _indicators)
-        {
-            try { ind.Close(); } catch { }
-            try { ind.Dispose(); } catch { }
-        }
-        _indicators.Clear();
+        // 状态灯是常驻的：不销毁，只变色（绿 = 关闭）
+        SetLights(false);
 
         // 音频还原（不区分模式，有记录就还原）
         if (_audioWasMute.HasValue)
@@ -636,41 +629,85 @@ internal sealed class BlackoutManager
     /// <summary>恢复屏幕显示（幂等：非黑屏状态调用也是安全的全面清理）。</summary>
     public void Restore() => ForceCleanup();
 
+    /// <summary>
+    /// 确保每块屏幕都有一个状态灯；数量/布局不匹配时按当前显示器重建。
+    /// 状态灯是常驻的（红=黑幕开启，绿=关闭），不随黑屏清理销毁。
+    /// </summary>
+    public void EnsureLights()
+    {
+        var screens = Screen.AllScreens;
+        bool needRebuild = _lights.Count != screens.Length ||
+                           _lights.Any(l => l.IsDisposed);
+
+        if (needRebuild)
+        {
+            foreach (var l in _lights)
+            {
+                try { l.Close(); } catch { }
+                try { l.Dispose(); } catch { }
+            }
+            _lights.Clear();
+            foreach (var screen in screens)
+            {
+                _lights.Add(new IndicatorForm(screen, _active));
+            }
+            foreach (var l in _lights) l.Show();
+        }
+        else
+        {
+            // 已有灯：校准位置（显示器排列可能变化）
+            for (int i = 0; i < screens.Length && i < _lights.Count; i++)
+            {
+                if (!_lights[i].IsDisposed) _lights[i].RebindScreen(screens[i]);
+            }
+        }
+    }
+
+    /// <summary>设置状态灯颜色：true=红（黑幕开启），false=绿（关闭）。</summary>
+    public void SetLights(bool on)
+    {
+        EnsureLights();
+        foreach (var l in _lights)
+        {
+            if (!l.IsDisposed) l.SetOn(on);
+        }
+    }
+
     private void OnDisplaySettingsChanged(object? sender, EventArgs e)
     {
-        if (!_active) return;
-        // 显示器变化：关闭旧遮罩，按当前显示器布局重建（含指示灯）
-        foreach (var form in _overlays)
+        // 黑屏中：遮罩跟随新布局重建
+        if (_active)
         {
-            try { form.Close(); } catch { }
-            try { form.Dispose(); } catch { }
-        }
-        _overlays.Clear();
+            foreach (var form in _overlays)
+            {
+                try { form.Close(); } catch { }
+                try { form.Dispose(); } catch { }
+            }
+            _overlays.Clear();
 
-        foreach (var ind in _indicators)
-        {
-            try { ind.Close(); } catch { }
-            try { ind.Dispose(); } catch { }
+            foreach (var screen in Screen.AllScreens)
+            {
+                var form = new BlackoutForm(screen, clickThrough: true);
+                _overlays.Add(form);
+            }
+            foreach (var form in _overlays) form.Show();
         }
-        _indicators.Clear();
 
-        foreach (var screen in Screen.AllScreens)
-        {
-            var form = new BlackoutForm(screen, clickThrough: true);
-            _overlays.Add(form);
-            if (_remoteMode) _indicators.Add(new IndicatorForm(screen));
-        }
-        foreach (var form in _overlays) form.Show();
-        foreach (var ind in _indicators) ind.Show();
+        // 状态灯是常驻的：无论是否黑屏都要跟随新显示器布局
+        EnsureLights();
+        SetLights(_active);
     }
 }
 
-// 远程隐身模式的状态指示灯：每块屏右上角一个小红点。
-// 关键：不做 WDA_EXCLUDEFROMCAPTURE —— 因此它会出现在手机远程画面里，
-// 红点在 = 远程隐身开启；红点消失 = 已关闭。点击穿透，不挡任何操作。
+// 常驻状态灯：每块屏右上角一个小圆点，显示黑幕开关状态。
+// 红点 = 黑幕开启（老板/远程模式），绿点 = 关闭。
+// 不做捕获排除——手机远程画面里也能看到，随时分辨开关状态。
+// 点击穿透，不挡任何操作。
 internal sealed class IndicatorForm : Form
 {
-    public IndicatorForm(Screen screen)
+    private bool _on;
+
+    public IndicatorForm(Screen screen, bool on)
     {
         FormBorderStyle = FormBorderStyle.None;
         StartPosition = FormStartPosition.Manual;
@@ -679,7 +716,20 @@ internal sealed class IndicatorForm : Form
         ShowInTaskbar = false;
         TopMost = true;
         BackColor = Color.Fuchsia;            // 品红作为透明键
-        TransparencyKey = Color.Fuchsia;      // 方形背景完全透明，只剩红点
+        TransparencyKey = Color.Fuchsia;      // 方形背景完全透明，只剩圆点
+        _on = on;
+    }
+
+    public void SetOn(bool on)
+    {
+        if (_on == on) return;
+        _on = on;
+        try { Invalidate(); } catch { }
+    }
+
+    public void RebindScreen(Screen screen)
+    {
+        Location = new Point(screen.Bounds.Right - 36, screen.Bounds.Top + 8);
     }
 
     protected override bool ShowWithoutActivation => true;
@@ -698,11 +748,21 @@ internal sealed class IndicatorForm : Form
     protected override void OnPaint(PaintEventArgs e)
     {
         base.OnPaint(e);
-        using var glow = new SolidBrush(Color.FromArgb(90, 255, 40, 40));
-        using var dot = new SolidBrush(Color.FromArgb(235, 25, 25));
         e.Graphics.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
-        e.Graphics.FillEllipse(glow, 3, 3, 22, 22);   // 外圈微光
-        e.Graphics.FillEllipse(dot, 7, 7, 14, 14);    // 红点
+        if (_on)
+        {
+            using var glow = new SolidBrush(Color.FromArgb(90, 255, 40, 40));
+            using var dot = new SolidBrush(Color.FromArgb(235, 25, 25));
+            e.Graphics.FillEllipse(glow, 3, 3, 22, 22);   // 外圈微光
+            e.Graphics.FillEllipse(dot, 7, 7, 14, 14);    // 红点 = 黑幕开启
+        }
+        else
+        {
+            using var glow = new SolidBrush(Color.FromArgb(80, 40, 200, 90));
+            using var dot = new SolidBrush(Color.FromArgb(30, 190, 90));
+            e.Graphics.FillEllipse(glow, 3, 3, 22, 22);   // 外圈微光
+            e.Graphics.FillEllipse(dot, 7, 7, 14, 14);    // 绿点 = 黑幕关闭
+        }
     }
 
     // 无损重申置顶（遮罩每 250ms 也会重申，指示灯必须保持在其之上）
