@@ -699,13 +699,16 @@ internal sealed class BlackoutManager
     }
 }
 
-// 常驻状态灯：每块屏右上角一个小圆点，显示黑幕开关状态。
-// 红点 = 黑幕开启（老板/远程模式），绿点 = 关闭。
-// 不做捕获排除——手机远程画面里也能看到，随时分辨开关状态。
-// 点击穿透，不挡任何操作。
+// 状态灯：每块屏右上角一个小圆点，显示黑幕开关状态。
+// 红点 = 黑幕开启（老板/远程模式）→ 常驻，随时可辨（手机远程画面也可见）。
+// 绿点 = 关闭 → 只显示 5 秒后淡出，桌面不留常驻点。
+// 不做捕获排除——远程画面里也能看到。点击穿透，不挡任何操作。
 internal sealed class IndicatorForm : Form
 {
     private bool _on;
+    private readonly System.Windows.Forms.Timer _fadeTimer = new() { Interval = 200 };
+    private const int HoldTicks = 25;      // 25 × 200ms = 5 秒保持
+    private int _tick;
 
     public IndicatorForm(Screen screen, bool on)
     {
@@ -717,14 +720,49 @@ internal sealed class IndicatorForm : Form
         TopMost = true;
         BackColor = Color.Fuchsia;            // 品红作为透明键
         TransparencyKey = Color.Fuchsia;      // 方形背景完全透明，只剩圆点
+        _fadeTimer.Tick += (s, e) => OnFadeTick();
         _on = on;
+        if (!on) { _fadeTimer.Start(); }      // 启动时绿灯：5 秒后淡出
+    }
+
+    protected override void Dispose(bool disposing)
+    {
+        try { _fadeTimer.Stop(); _fadeTimer.Dispose(); } catch { }
+        base.Dispose(disposing);
     }
 
     public void SetOn(bool on)
     {
         if (_on == on) return;
         _on = on;
+        if (on)
+        {
+            // 红灯：黑幕开启，常驻显示
+            _fadeTimer.Stop();
+            Opacity = 1.0;
+            Show();
+        }
+        else
+        {
+            // 绿灯：黑幕关闭，显示 5 秒后淡出
+            Opacity = 1.0;
+            Show();
+            _tick = 0;
+            _fadeTimer.Start();
+        }
         try { Invalidate(); } catch { }
+    }
+
+    private void OnFadeTick()
+    {
+        _tick++;
+        if (_tick <= HoldTicks) return;                 // 前 5 秒保持全亮
+        Opacity = Math.Max(0.0, Opacity - 0.1);         // 之后每 200ms 降 0.1 → 约 1 秒淡出
+        if (Opacity <= 0.01)
+        {
+            _fadeTimer.Stop();
+            try { Hide(); } catch { }
+        }
     }
 
     public void RebindScreen(Screen screen)
